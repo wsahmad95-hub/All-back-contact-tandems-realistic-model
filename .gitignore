@@ -1,0 +1,14 @@
+# Operating-system files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Temporary files and local Wolfram checkpoints
+~$*
+*.tmp
+*.bak
+*.mx
+*.lock
+
+# Keep research inputs, CSV outputs, notebooks, and figures trackable.
+# Add only specific large temporary files to this list when necessary.
