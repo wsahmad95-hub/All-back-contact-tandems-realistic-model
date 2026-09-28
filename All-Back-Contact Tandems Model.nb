@@ -1,0 +1,973 @@
+(* ::Package:: *)
+
+(*Modeling QIBC Perovskite/IBC Silicon Tandem Solar Cells Under Realistic Conditions*) 
+
+(* The Wolfram Language code provides a full-year simulation framework for QIBC perovskite/IBC silicon tandem solar cells under hourly spectral irradiance and temperature conditions. 
+It converts spectral data into photon-energy space, updates temperature-dependent device parameters, and evaluates 2T, VMM, and 4T configurations using experimentally derived EQE 
+data and models of optical, recombination, resistive, and leakage losses. The code also optimizes the perovskite optical thickness and VMM voltage ratio, calculates irradiance-weighted 
+PCE and annual energy yield, and exports the hourly results, moving-average data, and PCE-versus-irradiance plots with parallel processing and checkpoint recovery. This code file is a 
+modified derivative of RealisticTandem.nb by Moritz H. Futscher and Bruno Ehrler DOI: 10.1021/acsenergylett.7b00596). 
+   
+Original work licensed under the GNU General Public License, version 3 or any later version (GPL-3.0-or-later).
+
+Modifications for the QIBC perovskite/IBC-silicon tandem model:
+Waqas Ahmad, 2026.
+SPDX-License-Identifier: GPL-3.0-or-later
+ 
+   HOW TO USE
+   1. The spectral data should be transferred to a single folder 
+      (Let say "Input" folder)that should contain the annual spectral data 
+      file (For example: Singapore.xlsx)and the JV and EQE of both the subcells
+   2. The current code file should just be outside the"Input folder 
+   3. The small test in SECTION 5.2 will tell you how long
+      the full year evaluation will take before you commit to it. *)
+
+
+(*Input parameters*)
+
+(*Physical constants*)
+
+c = 299792458.; (* units: m / s *)
+h = 6.6260695729*10^-34; (* units: J s - Planck's Constant *)
+h2 = 4.136 10^-15; (* units: eV s - Planck's Constant *)
+q = 1.60217657*10^-19; (* units: Coulombs *)
+k = 8.617*10^-5; (* units: eV / K *)
+T = 298.15; (* units: K *)
+fac = h c 10^9/q; (* convert nm to eV *)
+k2 = 1.3807 10^-23; (* J/K *)
+
+(* Voltage-grid step used when building every JV-curve table below.
+   For more fine results, use 0.001 V, but it will cost computationallly.
+   Coarsen this first if you need more speed; 0.001-0.01 V is
+   usually indistinguishable from 0.001 V for a PCE estimate. *)
+dv = 0.02;
+
+
+(*Section 1 : Flux calculation for annual - realistic spectral input data*)
+
+makeFlux[data_] := {fac/#[[1]], h c/(fac/#[[1]])^2 #[[1]]/(h c) #[[2]]} & /@ data;
+\[CapitalGamma][En_] := Interpolation[makeFlux[AM1p5global]][En];
+
+(*Intrinsic carrier concentration of silicon as a function of temperature,calculated using the empirical relation reported by Misiakos et al.[J.Appl.Phys.1993,74,3293\[Dash]3297;
+DOI:10.1063/1.354551].Units:m^-3*)
+Sini[T_] := 5.29 10^19 (T/300.)^2.54 Exp[-6726./T]*10^6
+
+(*Section 2: IBC silicon solar cell model*) 
+
+(*Silicon bandgap as a function of temperature,evaluated using Varshni's empirical relation and parameters reported in Sze,Physics of Semiconductor Devices,Wiley-Interscience (1995).Units:eV*)
+SiBandgap[T_] := 1.17 - 4.73 10^-4 T^2./(T + 636.)
+
+(*Temperature-dependent Auger recombination coefficient for silicon,based on the measurements reported by Dziewior et al.[Appl.Phys.Lett.1977,30,346\[Dash]349;
+DOI:10.1063/1.89694].Coefficient scale:10^-43 m^6 s^-1*)
+SiC[T_] := 6.89*10^-43*(T/300.)^(1./2.)
+
+(*Import IBC silicon solar cell J - V & EQE*)
+
+RecordSi = Import[NotebookDirectory[] <> "Input/IV-HTIBC-Si.csv"];
+RecordSiEQE = Import[NotebookDirectory[] <> "Input/EQE-HTIBC-Si.csv"];
+EQESi = Interpolation[SortBy[RecordSiEQE, First], InterpolationOrder -> 1];
+
+(*Recombination current terms and parasitic resistances*)
+
+JRad0Si = q 2 Pi/(c^2 h2^3) NIntegrate[En^2/(Exp[En/(k T)] - 1), {En, SiBandgap[T], 4.4}];
+JRAuger[V_, Il_, Rs_] := q L SiC[T] Sini[T]^3 (Exp[(3 (V + Il*Rs*0.0001))/(2 k T)] - 1);
+JRnonSi[V_, Il_, Rs_] := 9.9*10^-43 Sini[T]^2 (Exp[(V + Il*Rs*0.0001)/(k T)] - 1);
+Resistance[V_, Il_, Rs_, Rsh_] := (V + Il*Rs*0.0001)/(Rsh*0.0001);
+L = 1.75*10^-4; (* Si thickness, units: m *)
+RsSi = 0.01; RshSi = 27000.; (* units: Ohm cm^2 *)
+
+(*Coupled terms*)
+
+JRSi[V_, Il_, Rs_] := JRad0Si (Exp[(V + Il*Rs*0.0001)/(k T)] - 1);
+SQSi[Eg1_] := Quiet[{
+   dSi = Table[{v1, FindRoot[Il == jgSi - JRSi[v1, Il, RsSi] - JRAuger[v1, Il, RsSi] -
+        JRnonSi[v1, Il, RsSi] - Resistance[v1, Il, RsSi, RshSi], {Il, 0}][[1, 2]]}, {v1, 0, Eg1, .001}];
+   ivSi = Interpolation[dSi, InterpolationOrder -> 1];
+   vocSi = FindRoot[ivSi[v], {v, Eg1 - 0.2}][[1, 2]];
+   jscSi = ivSi[0]/10;
+   NMaximize[{100 ivSi[V] V/PowerofSun, 0 < V < Eg1}, V]
+   }][[1, 1]];
+
+(*Section 3: QIBC PSC model*)
+
+(*Temperature-dependent bandgap model for the CsFAMA perovskite absorber,based on the temperature-dependent energy levels reported by W.A.Saidi,S.Ponc\[EAcute],and B.Monserrat.J.Phys.Chem.Lett.2016,7,5247\[Dash]5252. DOI:10.1021/acs.jpclett.6b02560.A lower temperature coefficient than that reported for MAPbI3 was adopted in accordance with the improved lattice stability of Cs-containing triple-cation perovskites reported by Saliba et al.Energy Environ.Sci.2016,9,1989\[Dash]1997. DOI:10.1039/C5EE03874J.*)(*Units:eV*)
+PerovskiteBandgap[T_] := 1.530555 + 0.0003*T
+
+(*Temperature-dependent intrinsic carrier concentration calculated using equal effective densities of states in the conduction and valence bands,with NC=NV=3.97*10^18 cm^-3 at 25 \[Degree]C.*)(*Units:m^-3*)
+Perovskiteni[T_] := 6.02`*^20*T^(3/2)*Exp[-PerovskiteBandgap[T]/(2 k T)]
+
+(*Temperature-dependent built-in potential of the perovskite absorber.*)(*Units:V*)
+PerovskiteVbi[T_] := (k2 T)/q*Log[E, 3.74629`*^45/Perovskiteni[T]^2]
+
+(*Illumination-intensity-dependent charge-carrier lifetime obtained by fitting the experimental data reported by D.W.DeQuilettes et al.Science 2015,348,683\[Dash]686. DOI:10.1126/science.aaa5333.*)(*Units:\[Mu]s*)
+PerovskiteT[Irradiation_] := 2.63041*Irradiation^(-0.14)
+
+(*Import QIBC PSC J-V & EQE*)
+
+RecordPerovskiteForward = Import[NotebookDirectory[] <> "Input/JV-Ideal-1.62.csv"];
+RecordPerovskiteEQE = Import[NotebookDirectory[] <> "Input/EQE-ideal-1.62.csv"];
+EQEPerovskite = Interpolation[SortBy[RecordPerovskiteEQE, First], InterpolationOrder -> 1];
+
+(*Recombination current terms and parasitic resistances*)
+
+(* Radiative recombination current density *)
+JRad0Perovskite = q 2 Pi/(c^2 h2^3) NIntegrate[En^2/(Exp[En/(k T)] - 1), {En, PerovskiteBandgap[T], 4.4}];
+
+(* Non-radiative recombination current density *)
+JRnonPerovskite[V_, Il_, Rs_] := 4.18*10^-18 Perovskiteni[T] Re[Sqrt[(PerovskiteVbi[T] - V)]]/
+     PerovskiteT[PowerofSun] (Exp[(V + Il*Rs*0.0001)/(2 k T)] - 1);
+     
+ (* Resistance *)
+RsPerovskite = 5.; RshPerovskite = 1200.; (* units: Ohm cm^2 *)
+
+(*Coupled terms*)
+
+JRPerovskite[V_, Il_, Rs_] := JRad0Perovskite (Exp[(V + Il*Rs*0.0001)/(k T)] - 1);
+SQPerovskite[Eg1_] := Quiet[{
+   dPerovskite = Table[{v1, FindRoot[Il == jgPerovskite - JRPerovskite[v1, Il, RsPerovskite] -
+        JRnonPerovskite[v1, Il, RsPerovskite] - Resistance[v1, Il, RsPerovskite, RshPerovskite],
+       {Il, 0}][[1, 2]]}, {v1, 0, Eg1, .001}];
+   ivPerovskite = Interpolation[dPerovskite, InterpolationOrder -> 1];
+   vocPerovskite = FindRoot[ivPerovskite[v], {v, Eg1 - 0.2}][[1, 2]];
+   jscPerovskite = ivPerovskite[0]/10;
+   NMaximize[{100 ivPerovskite[V] V/PowerofSun, 0 < V < Eg1}, V]
+   }][[1, 1]];
+   
+(*QIBC perovskite/IBC silicon solar cells tandem*)
+  
+(*Optical coupling*)
+
+(* optical coupling between the two sub-cells (spectrum-independent)*)
+(* Gaussian fit of the perovskite's long-wavelength EQE tail *)
+model[x_] = 0.0876 Evaluate[PDF[NormalDistribution[x0, sigma], x]];
+dataFit = Table[{i, EQEPerovskite[i]}, {i, 1.45, 1.75, 0.01}];
+fit = FindFit[dataFit, model[x], {x0, sigma}, x];
+gam=0.303;
+(* light transmitted through a full-thickness QIBC perovskite top cell.
+   Contact/parasitic loss constant 0.303 (30.3%)*)
+TransmittedtoSi = Interpolation[
+   Join[Table[{x, gam + model[x] /. fit}, {x, 0.8, 1.70, 0.01}],
+    Table[{i, Fit[{{1.70, gam + model[1.70] /. fit}, {2.0, 1}}, {1, x}, x] /. x -> i}, {i, 1.71, 2, 0.01}],
+    Table[{x, 1}, {x, 2.01, 4, 0.01}]], InterpolationOrder -> 1];
+EQESiback = Interpolation[
+   Replace[Table[{x, EQESi[x] - TransmittedtoSi[x]}, {x, 0.8, 4, 0.01}], n_?(# < 0 &) -> 0, {2}],
+   InterpolationOrder -> 1];
+
+(*"thick" controls the thickness of the top perovskite absorber layer thickness.
+   In 2T tandem, it assist in current-matching.*)
+thick = 1.; (* optimized optical thickness of the perovskite top cell --
+                 this is the ONE place to change it; everything else in
+                 the file (TransmittedtoSithin, EQESibackthin,
+                 EQEPerovskitethin) references this variable, so
+                 changing it here and re-running Section 1 onward is
+                 all that's needed to test a different value. *)
+TransmittedtoSithin = Interpolation[
+   Join[Table[{x, gam + thick*(model[x] /. fit)}, {x, 0.8, 1.70, 0.01}],
+    Table[{i, (Fit[{{1.70, gam + model[1.70] /. fit}, {2, 1}}, {1, x}, x] /. x -> i)*thick}, {i, 2.1, 2, 0.01}],
+    Table[{x, thick*1}, {x, 2.1, 4, 0.01}]], InterpolationOrder -> 1];
+EQESibackthin = Interpolation[
+   Replace[Table[{x, EQESi[x] - TransmittedtoSithin[x]}, {x, 0.8, 4, 0.01}], n_?(# < 0 &) -> 0, {2}],
+   InterpolationOrder -> 1];
+EQEPerovskitethin = Interpolation[Table[{x, EQEPerovskite[x]*thick}, {x, 0.8, 4, 0.01}], InterpolationOrder -> 1];
+
+(* tandem recombination terms (4-arg versions, with sub-cell fraction fg) *)
+JRPerovskite[V_, Il_, fg_, Rs_] := fg JRad0Perovskite (Exp[(V + Il*Rs*0.0001)/(k T)] - 1);
+JRSi[V_, Il_, fg_, Rs_] := fg JRad0Si (Exp[(V + Il*Rs*0.0001)/(k T)] - 1);
+
+(*Series-connected (2T) tandem*)
+
+SQSeries[Eg1_, Eg2_] := Module[
+   {dSi, ivSi, vocSi, jscSi, dPerovskite, ivPerovskite, vocPerovskite,
+    jscPerovskite, iMax, nPts, v1g, v2g, ivCurve, result},
+   result = Check[
+      Quiet[
+       (
+       dSi = Table[{v1, FindRoot[Il1 == jgSitandemthin - JRSi[v1, Il1, 1, RsSi] - JRAuger[v1, Il1, RsSi] -
+             JRnonSi[v1, Il1, RsSi] - Resistance[v1, Il1, RsSi, RshSi], {Il1, 0}][[1, 2]]},
+         {v1, 0, Eg1 - 0.1, dv}];
+       ivSi = Interpolation[dSi, InterpolationOrder -> 1];
+       vocSi = v1 /. FindRoot[ivSi[v1] == 0, {v1, Eg1 - 0.2}];
+       jscSi = ivSi[0];
+
+       dPerovskite = Table[{v2, FindRoot[Il2 == jgPerovskitetandemthin - JRPerovskite[v2, Il2, 2, RsPerovskite] -
+             JRnonPerovskite[v2, Il2, RsPerovskite] - Resistance[v2, Il2, RsPerovskite, RshPerovskite],
+            {Il2, 0}][[1, 2]]}, {v2, 0, Eg2 - 0.2, dv}];
+       ivPerovskite = Interpolation[dPerovskite, InterpolationOrder -> 1];
+       vocPerovskite = v2 /. FindRoot[ivPerovskite[v2] == 0, {v2, Eg2 - 0.3}];
+       jscPerovskite = ivPerovskite[0];
+
+       (* guard: under low/mismatched illumination one sub-cell's Voc can
+          collapse to <=0. Return 0% instead of feeding a degenerate
+          curve into the matching step below. *)
+       If[vocSi <= 0 || vocPerovskite <= 0,
+        0,
+        (
+         (* Robust series current-matching: a series-connected tandem
+            carries the SAME current through both sub-cells. Sweep that
+            shared current I from Isc down to 0, and at each I solve
+            v1 such that ivSi[v1]==I and v2 such that ivPerovskite[v2]==I,
+            warm-starting each FindRoot from the previous point's answer
+            (the curves are smooth, so this converges in ~1 Newton step
+            and is immune to the "duplicate/flat data" failure that
+            Interpolation-based inversion has near Isc). *)
+         iMax = Min[jscSi, jscPerovskite];
+         nPts = 300;
+         v1g = 0.; v2g = 0.;
+         ivCurve = Table[
+           With[{Itarget = iMax (1 - j/nPts)},
+            v1g = v1 /. FindRoot[ivSi[v1] == Itarget, {v1, v1g}];
+            v2g = v2 /. FindRoot[ivPerovskite[v2] == Itarget, {v2, v2g}];
+            {v1g + v2g, Itarget}
+            ],
+           {j, 0, nPts}];
+         NMaximize[{100 Interpolation[ivCurve, InterpolationOrder -> 1][V] V/PowerofSun,
+            First[ivCurve][[1]] < V < Last[ivCurve][[1]]}, V][[1]]
+         )]
+       )], $Failed];
+   result
+   ];
+   
+(*Voltaged-matched module (VMM) tandem*)
+
+SQModule[Eg1_, Eg2_, n_, dPerovskiteShared_] := Quiet[{
+   dSi = Table[{v1, FindRoot[Il1 == (jgSitandem - JRSi[v1/n, Il1, 1, RsSi] - JRAuger[v1/n, Il1, RsSi] -
+         JRnonSi[v1/n, Il1, RsSi] - Resistance[v1/n, Il1, RsSi, RshSi])/n, {Il1, 0}][[1, 2]]}, {v1, 0, (Eg1 - 0.1)*n, dv}];
+   ivSi = Interpolation[dSi, InterpolationOrder -> 1];
+   vocSi = FindRoot[ivSi[v], {v, (Eg1 - 0.2)*n}][[1, 2]];
+   jscSi = ivSi[0];
+   dPerovskite = dPerovskiteShared;
+   ivPerovskite = Interpolation[dPerovskite, InterpolationOrder -> 1];
+   vocPerovskite = FindRoot[ivPerovskite[v], {v, Eg2 - 0.3}][[1, 2]];
+   jscPerovskite = ivPerovskite[0];
+   dMod = Table[{v, Interpolation[dSi][v] + Interpolation[dPerovskite][v]}, {v, 0, Eg2 - 0.2, dv}];
+   ivMod = Interpolation[dMod, InterpolationOrder -> 1];
+   voc = FindRoot[ivMod[v], {v, Eg2 - 0.3}][[1, 2]];
+   If[voc <= 0, 0, NMaximize[{100 ivMod[V] V/PowerofSun, 0 < V < voc}, V][[1]]]
+   }][[1]];
+   
+(*Independent (4T) tandem*)
+
+SQFour[Eg1_, Eg2_, dPerovskiteShared_] := Quiet[{
+   dSi = Table[{v1, FindRoot[Il1 == jgSitandem - JRSi[v1, Il1, 1, RsSi] - JRAuger[v1, Il1, RsSi] -
+        JRnonSi[v1, Il1, RsSi] - Resistance[v1, Il1, RsSi, RshSi], {Il1, 0}][[1, 2]]}, {v1, 0, Eg1 - 0.1, dv}];
+   ivSi = Interpolation[dSi, InterpolationOrder -> 1];
+   vocSi = FindRoot[ivSi[v], {v, Eg1 - 0.2}][[1, 2]];
+   jscSi = ivSi[0];
+   dPerovskite = dPerovskiteShared;
+   ivPerovskite = Interpolation[dPerovskite, InterpolationOrder -> 1];
+   vocPerovskite = FindRoot[ivPerovskite[v], {v, Eg2 - 0.3}][[1, 2]];
+   jscPerovskite = ivPerovskite[0];
+   (If[vocSi <= 0, 0, NMaximize[{100 ivSi[V] V/PowerofSun, 0 < V < vocSi}, V][[1]]]) +
+    (If[vocPerovskite <= 0, 0, NMaximize[{100 ivPerovskite[V] V/PowerofSun, 0 < V < vocPerovskite}, V][[1]]])
+   }][[1]];
+
+
+(*Section 4: Realistic location-based temperature data*)
+
+(*Make radiative recombination respond to T*)
+(* JRad0Si and JRad0Perovskite were computed ONCE in Section 2 and section 3 via "="
+   (immediate assignment), using whatever T happened to be at that
+   moment (298.15 K). Every OTHER T-dependent piece in this model
+   (SiBandgap[T], PerovskiteBandgap[T], Sini[T], SiC[T], Perovskiteni[T],
+   PerovskiteVbi[T], and the JRAuger/JRnonSi/JRSi/JRnonPerovskite/
+   JRPerovskite functions, all defined with ":=") DOES correctly pick up
+   a new T value at call time.*)
+(* Import the temperature data. The timestamp-alignment CHECK against the spectral data. *)
+temperatureFile = NotebookDirectory[] <> "Input/Singapore-Temperature.xlsx";
+rawTemperature = Import[temperatureFile, {"Data", 1}];
+temperatureRows = Rest[rawTemperature];         (* {DateObject, Temperature(K)} pairs *)
+temperatureTimeStamps = temperatureRows[[All, 1]];
+temperatures = temperatureRows[[All, 2]];
+
+tempMargin = 3.; (* K -- safety margin beyond the observed min/max so a
+                     temperature slightly outside your recorded range
+                     (e.g. a future dataset, or interpolation roundoff)
+                     doesn't fall outside the table and error *)
+tempTableMin = Min[temperatures] - tempMargin;
+tempTableMax = Max[temperatures] + tempMargin;
+tempTableStep = 0.5; (* K -- resolution of the precomputed table; both
+                         JRad0Si and JRad0Perovskite vary smoothly and
+                         weakly with T over a realistic outdoor range,
+                         so 0.5 K spacing is far finer than needed for
+                         accuracy, while still being cheap to build *)
+
+Print["Building temperature-dependent recombination tables over ",
+  tempTableMin, " to ", tempTableMax, " K (data range: ",
+  Min[temperatures], "-", Max[temperatures], " K)..."];
+
+JRad0SiTable = Table[
+   {TVal, Quiet[q 2 Pi/(c^2 h2^3) NIntegrate[
+       En^2/(Exp[En/(k TVal)] - 1), {En, SiBandgap[TVal], 4.4}]]},
+   {TVal, tempTableMin, tempTableMax, tempTableStep}
+   ];
+JRad0PerovskiteTable = Table[
+   {TVal, Quiet[q 2 Pi/(c^2 h2^3) NIntegrate[
+       En^2/(Exp[En/(k TVal)] - 1), {En, PerovskiteBandgap[TVal], 4.4}]]},
+   {TVal, tempTableMin, tempTableMax, tempTableStep}
+   ];
+
+JRad0SiOfT = Interpolation[JRad0SiTable];
+JRad0PerovskiteOfT = Interpolation[JRad0PerovskiteTable];
+
+Print["Done. (sanity check: JRad0SiOfT[298.15] = ", JRad0SiOfT[298.15])"];
+
+
+(*Section 4.1: Import the realistic spectral data*)
+
+spectraFile = NotebookDirectory[] <> "Input/Singapore-Spectra.xlsx";
+
+rawSpectra = Import[spectraFile, {"Data", 1}];
+
+wavelengthsRealistic = Rest[First[rawSpectra]];     (* For example, one of our location data comprises {300, ..., 4000} nm, ~1962 columns *)
+spectraRows = Rest[rawSpectra];                     (* 8784 rows, one per hour *)
+timeStamps = spectraRows[[All, 1]];                   (* dates/times, column A *)
+
+allIntervals = Differences[AbsoluteTime /@ timeStamps]/3600.;
+Print["Timestep range across full dataset: ", Min[allIntervals], " to ", Max[allIntervals], " hours (", Length[Union[Round[allIntervals, 0.01]]], " distinct value(s))"];
+
+irradianceMatrix = spectraRows[[All, 2 ;;]];           (* wavelength columns; some cells are the text "nan" *)
+
+allSpectra = Table[
+   Select[Transpose[{wavelengthsRealistic, irradianceMatrix[[i]]}], NumericQ[#[[2]]] &],
+   {i, Length[irradianceMatrix]}
+   ];
+
+(* Flag any timestep left with too few valid wavelength points to build
+   a meaningful spectrum (e.g. an entire row that was mostly "nan"), so
+   you know about it rather than it silently producing a near-zero
+   PowerofSun / garbage PCE for that one row. *)
+tooSparse = Position[Length /@ allSpectra, n_ /; n < 10];
+If[Length[tooSparse] > 0,
+  Print["WARNING: ", Length[tooSparse], " timestep(s) have fewer than 10 valid wavelength points ",
+    "after removing \"nan\" entries (first at row ", First[tooSparse][[1]],
+    "). These will likely just get zeroed out by the low-light guard below rather than break the run, ",
+    "but worth spot-checking that row in the dataset."]
+  ];
+
+Print["Loaded ", Length[allSpectra], " spectra spanning ",
+  First[timeStamps], " to ", Last[timeStamps],
+  " (", Min[Length /@ allSpectra], "-", Max[Length /@ allSpectra], " valid wavelength points per spectrum)"];
+(* ***** END OF RESTORED BLOCK ***** *)
+
+
+(*Section 4.2: verify temperature data lines up with spectral data*)
+
+(* Everything below pairs allSpectra[[i]] with temperatures[[i]] purely
+   by matching INDEX -- it never re-checks the actual dates. If the two
+   files don't have identical row counts and identical timestamps (same
+   year, same hourly cadence, same starting date), pairing by index
+   silently mismatches spectrum-at-time-A with temperature-at-time-B.
+   This check catches that up front rather than letting it corrupt an
+   entire annual run silently. *)
+
+If[Length[temperatures] != Length[timeStamps],
+  Print["ERROR: temperature data has ", Length[temperatures],
+    " rows but spectral data has ", Length[timeStamps],
+    " rows -- these MUST match one-to-one for per-timestep pairing to be valid. ",
+    "Check that both files cover the same year at the same time resolution."];
+  Abort[]
+  ];
+
+timestampMismatches = Position[
+   MapThread[Abs[AbsoluteTime[#1] - AbsoluteTime[#2]] > 1 &, {timeStamps, temperatureTimeStamps}],
+   True
+   ];
+If[Length[timestampMismatches] > 0,
+  Print["WARNING: ", Length[timestampMismatches],
+    " row(s) where the spectral and temperature timestamps differ by more than 1 second ",
+    "(first mismatch at row ", First[timestampMismatches][[1]],
+    ": spectral=", timeStamps[[First[timestampMismatches][[1]]]],
+    ", temperature=", temperatureTimeStamps[[First[timestampMismatches][[1]]]],
+    "). Row-index pairing below assumes these line up -- fix the source files' date ranges/ordering before trusting the results."],
+  Print["Timestamp check passed: all ", Length[timeStamps],
+    " spectral and temperature rows are date-aligned."]
+  ];
+
+
+(*Section 5: Cutomized evaluation*)
+
+(* Toggle off whichever architectures you don't need -- each one costs
+   roughly a third of the per-timestep time, so turning two off is the
+   single biggest speed lever available (bigger than dv, bigger than
+   parallelization alone). Skipping an architecture also skips its
+   generation-current integrals below, not just its SQ* call. *)
+computeSeries = True;
+computeModule = True;
+computeFour = True;
+
+(* Module (voltage-matched string) ratio -- number of Si bottom cells
+   connected in series per perovskite top cell, chosen to voltage-match
+   the combined string. This is the ONE place to change it; SQModule's
+   call below references this variable rather than a hardcoded number,
+   so changing it here and re-running Section 6 is all that's needed to
+   test a different value. *)
+moduleRatio = 2.05;
+
+(* Below this irradiance, FindRoot/NMaximize's fixed *absolute* numerical
+   tolerance becomes a large *relative* error once divided by such a
+   small PowerofSun (PCE = 100*P/G) -- producing noisy or even
+   thermodynamically-impossible PCE spikes rather than a genuinely low
+   but real number. 20 W/m^2 keeps a comfortable margin above that noise
+   floor; raise further if you still see implausible values near this
+   cutoff, lower it if you want to keep more low-light data points. *)
+lowLightCutoff = 20.;
+
+(* A 2-junction tandem's absolute thermodynamic ceiling is ~45-46% under
+   1-sun broadband illumination; this device's own AM1.5G benchmark is
+   well under that. Anything reported meaningfully above the ceiling is
+   a numerical artifact, not a real result -- flag it as Missing rather
+   than silently keeping it. *)
+pceSanityCeiling = 50.;
+sanitizePCE[pce_] := If[NumericQ[pce] && 0 <= pce <= pceSanityCeiling, pce, Missing["Unreliable"]];
+
+(* Takes a {spectrumPairs, temperature} pair (rather than two separate
+   arguments) so it plugs directly into ParallelMap over a zipped list
+   in Section 5 below -- ParallelMap only ships each kernel the specific
+   elements it's processing, so zipping spectrum+temperature together
+   per row keeps that same "never ship the whole array" property intact.
+
+   T (and the temperature-dependent JRad0Si/JRad0Perovskite from Section
+   1.5) are rebound here via Block's DYNAMIC scoping -- meaning every
+   :=-defined function called anywhere inside this dynamic extent
+   (JRAuger, JRnonSi, JRSi, JRPerovskite, JRnonPerovskite, and any
+   SiBandgap[T]/PerovskiteBandgap[T] call) automatically sees THIS
+   timestep's temperature, not the old fixed 298.15 K global. This also
+   makes it safely per-timestep under parallelization: each kernel's
+   Block call is independent, so there's no risk of one kernel's
+   temperature leaking into another's calculation. *)
+   
+runTandemForSpectrum[{spectrumPairs_, temperature_}] := Block[
+   {AM1p5global = spectrumPairs, T = temperature,
+    JRad0Si = JRad0SiOfT[temperature], JRad0Perovskite = JRad0PerovskiteOfT[temperature],
+    \[CapitalGamma], GammaInterp, PowerofSun,
+    jgSitandem, jgPerovskitetandem, jgSitandemthin, jgPerovskitetandemthin,
+    dPerovskiteTandemShared},
+
+   PowerofSun = Quiet[Integrate[Interpolation[AM1p5global][wl],
+       {wl, AM1p5global[[1, 1]], AM1p5global[[-1, 1]]}]];
+
+   (* Skip near-dark timesteps (dawn/dusk noise, or true nighttime rows) --
+      running the full FindRoot/NMaximize machinery on ~0 W/m^2 is both
+      wasteful and numerically meaningless (Voc, PCE undefined at 0 sun). *)
+   If[! NumericQ[PowerofSun] || PowerofSun < lowLightCutoff,
+    {If[NumericQ[PowerofSun], PowerofSun, 0], 0, 0, 0, temperature},
+
+    (
+     (* cache the flux interpolation ONCE per timestep instead of
+        rebuilding it on every single NIntegrate sample point. *)
+     GammaInterp = Interpolation[makeFlux[AM1p5global]];
+     \[CapitalGamma][En_] := GammaInterp[En];
+
+     If[computeModule || computeFour,
+      (
+       jgSitandem = Quiet[NIntegrate[EQESiback[En] \[CapitalGamma][En], {En, 0.8, 3.5}]];
+       jgPerovskitetandem = Quiet[NIntegrate[EQEPerovskite[En] \[CapitalGamma][En], {En, 1.2, 4.4}]];
+       (* built once, shared by SQModule and SQFour instead of each
+          rebuilding an identical table *)
+       dPerovskiteTandemShared = Quiet[Table[
+         {v2, FindRoot[Il2 == jgPerovskitetandem - JRPerovskite[v2, Il2, 2, RsPerovskite] -
+             JRnonPerovskite[v2, Il2, RsPerovskite] - Resistance[v2, Il2, RsPerovskite, RshPerovskite],
+            {Il2, 0}][[1, 2]]},
+         {v2, 0, PerovskiteBandgap[T] - 0.2, dv}]];
+       )];
+     If[computeSeries,
+      (
+       jgSitandemthin = Quiet[NIntegrate[EQESibackthin[En] \[CapitalGamma][En], {En, 0.8, 3.5}]];
+       jgPerovskitetandemthin = Quiet[NIntegrate[EQEPerovskitethin[En] \[CapitalGamma][En], {En, 1.2, 4.4}]];
+       )];
+
+     {
+      PowerofSun,
+      If[computeSeries, sanitizePCE[Check[Quiet[SQSeries[SiBandgap[T], PerovskiteBandgap[T]]], $Failed]], Missing["NotComputed"]],
+      If[computeModule, sanitizePCE[Check[Quiet[SQModule[SiBandgap[T], PerovskiteBandgap[T], moduleRatio, dPerovskiteTandemShared]], $Failed]], Missing["NotComputed"]],
+      If[computeFour, sanitizePCE[Check[Quiet[SQFour[SiBandgap[T], PerovskiteBandgap[T], dPerovskiteTandemShared]], $Failed]], Missing["NotComputed"]],
+      temperature
+      }
+     )
+    ]
+   ];
+
+
+(*Section 5.1: Auto-optomize thick & module ratio*)
+
+(* Whenever you switch to a new location's spectral file, or change a
+   bandgap/EQE/device parameter in Section 2 and section 3, the values of thick
+   (Series current-matching) and moduleRatio (Module voltage-matching)
+   will be optimized accordingly.
+   This section finds new optimal values automatically and sets them as
+   the active thick/moduleRatio for everything below.
+
+   WHY THIS DOESN'T JUST RUN THE FULL YEAR FOR EVERY CANDIDATE VALUE?
+   (which would take far too long):
+     - thick affects ONLY Series (2T), via EQESibackthin/EQEPerovskitethin.
+       Each candidate genuinely needs fresh NIntegrate work per spectrum,
+       so this sweep runs on a representative SUBSET of the year, not
+       all full annual dataser (8784+ timesteps in our case).
+     - moduleRatio affects ONLY Module (VMM), and critically, it's just
+       an ARGUMENT to SQModule -- jgSitandem, jgPerovskitetandem, and
+       the shared perovskite JV table do NOT depend on it at all. So
+       those are computed ONCE per sample spectrum, then many candidate
+       moduleRatio values are tried almost for free -- this sweep can
+       afford a much finer grid than the thick sweep above it.
+
+   RECOMMENDED WORKFLOW: leave autoOptimizeParameters = True, run this
+   section once per new dataset/device-parameter change, then run
+   Section 5.2 (quick test) and Section 6 (full year) as normal -- they'll
+   automatically use whatever thick/moduleRatio this section found.*)
+
+(*Rebuilds TransmittedtoSithin/EQESibackthin/EQEPerovskitethin from
+   whatever the CURRENT global thick is -- the single place this
+   formula lives, so the auto-optimize path and the "set thick manually"
+   path can never drift out of sync with each other. SQSeries only ever
+   sees these three functions, never thick directly, so if you ever set
+   thick by hand (autoOptimizeParameters = False), you MUST call this
+   once afterward, or SQSeries will keep using stale, previously-built
+   curves that don't match your new thick value.*)
+   
+finalizeThinOptics[] := (
+   TransmittedtoSithin = Interpolation[
+      Join[Table[{x, gam + thick*(model[x] /. fit)}, {x, 0.8, 1.70, 0.01}],
+       Table[{i, (Fit[{{1.70, gam + model[1.70] /. fit}, {2, 1}}, {1, x}, x] /. x -> i)*thick}, {i, 2.1, 2, 0.01}],
+       Table[{x, thick*1}, {x, 2.1, 4, 0.01}]], InterpolationOrder -> 1];
+   EQESibackthin = Interpolation[
+      Replace[Table[{x, EQESi[x] - TransmittedtoSithin[x]}, {x, 0.8, 4, 0.01}], n_?(# < 0 &) -> 0, {2}],
+      InterpolationOrder -> 1];
+   EQEPerovskitethin = Interpolation[Table[{x, EQEPerovskite[x]*thick}, {x, 0.8, 4.4, 0.01}], InterpolationOrder -> 1];
+   );
+
+autoOptimizeParameters = True; (* set False to skip the sweep below and
+   just use the thick/moduleRatio values set manually in Section 1/3 *)
+
+If[autoOptimizeParameters,
+ Module[{},
+
+  (* --- representative sample: an irradiance-stratified subset of
+     daylight spectra, shared by both sweeps below --- *)
+  optimSampleSize = 200; (* larger = more accurate optimum, slower sweep.
+                             150-300 is usually enough since we only need
+                             the TREND vs thick/moduleRatio, not exact
+                             per-timestep precision. *)
+
+  daylightPowerOfSun = Table[
+    Quiet[Integrate[Interpolation[allSpectra[[i]]][wl],
+        {wl, allSpectra[[i, 1, 1]], allSpectra[[i, -1, 1]]}]],
+    {i, Length[allSpectra]}
+    ];
+  daylightSpectraIdx = Select[Range[Length[allSpectra]],
+    NumericQ[daylightPowerOfSun[[#]]] && daylightPowerOfSun[[#]] > lowLightCutoff &];
+
+  optimSampleIdx = If[Length[daylightSpectraIdx] > optimSampleSize,
+    daylightSpectraIdx[[Round[Range[1, Length[daylightSpectraIdx],
+        N[Length[daylightSpectraIdx]/optimSampleSize]]]]],
+    daylightSpectraIdx
+    ];
+  optimSample = allSpectra[[optimSampleIdx]];
+  optimSampleIrradiance = daylightPowerOfSun[[optimSampleIdx]];
+
+  Print["Parameter optimization will use ", Length[optimSample],
+    " representative daylight spectra out of ", Length[allSpectra],
+    " total (", Length[daylightSpectraIdx], " daylight timesteps)."];
+
+  (* thick optimization (Series/2T only)*)
+
+  (* Rebuilds the thick-dependent optics for ONE candidate value, using
+     the exact same formulas as Section 1's TransmittedtoSithin/
+     EQESibackthin/EQEPerovskitethin -- parameterized so a candidate can
+     be tested without touching the real global functions until the
+     optimum is found and finalized below. *)
+     
+  thinOpticsForThick[thickVal_] := Module[{transThin, eqeSiThin, eqePerThin},
+     transThin = Interpolation[
+       Join[Table[{x, gam + thickVal*(model[x] /. fit)}, {x, 0.8, 1.70, 0.01}],
+        Table[{i, (Fit[{{1.70, gam + model[1.70] /. fit}, {2.0, 1}}, {1, x}, x] /. x -> i)*thickVal}, {i, 1.71, 2, 0.01}],
+        Table[{x, thickVal*1}, {x, 2.01, 4, 0.01}]], InterpolationOrder -> 1];
+     eqeSiThin = Interpolation[
+       Replace[Table[{x, EQESi[x] - transThin[x]}, {x, 0.8, 4, 0.01}], n_?(# < 0 &) -> 0, {2}],
+       InterpolationOrder -> 1];
+     eqePerThin = Interpolation[Table[{x, EQEPerovskite[x]*thickVal}, {x, 0.8, 4.4, 0.01}], InterpolationOrder -> 1];
+     {eqeSiThin, eqePerThin}
+     ];
+
+  evalSeriesForThick[thickVal_] := Module[{eqeSiThinC, eqePerThinC, pceList},
+     {eqeSiThinC, eqePerThinC} = thinOpticsForThick[thickVal];
+     pceList = Table[
+       Block[{AM1p5global = optimSample[[i]], GammaInterp, jgSiThinC, jgPerThinC, pce, PowerofSun, jgSitandemthin, jgPerovskitetandemthin},
+        GammaInterp = Interpolation[makeFlux[AM1p5global]];
+        jgSiThinC = Quiet[NIntegrate[eqeSiThinC[En] GammaInterp[En], {En, 0.8, 3.5}]];
+        jgPerThinC = Quiet[NIntegrate[eqePerThinC[En] GammaInterp[En], {En, 1.2, 4.4}]];
+        PowerofSun = optimSampleIrradiance[[i]];
+        jgSitandemthin = jgSiThinC; jgPerovskitetandemthin = jgPerThinC;
+        pce = sanitizePCE[Check[Quiet[SQSeries[SiBandgap[T], PerovskiteBandgap[T]]], $Failed]];
+        If[NumericQ[pce], pce, 0]
+        ],
+       {i, Length[optimSample]}
+       ];
+     Total[pceList*optimSampleIrradiance]/Total[optimSampleIrradiance]
+     ];
+
+  thickCoarseGrid = Range[0.5, 1.0, 0.05];
+  Print["--- Optimizing thick (coarse sweep, Series/2T) ---"];
+  thickCoarseResults = Table[
+    Module[{pce = evalSeriesForThick[tc]},
+     Print["  thick = ", tc, "  ->  weighted Series PCE = ", pce, " %"];
+     {tc, pce}
+     ],
+    {tc, thickCoarseGrid}
+    ];
+  thickCoarseBest = First[MaximalBy[thickCoarseResults, Last]][[1]];
+
+  thickFineGrid = Range[Max[0.1, thickCoarseBest - 0.05], Min[1.0, thickCoarseBest + 0.05], 0.01];
+  Print["--- Optimizing thick (fine sweep around ", thickCoarseBest, ") ---"];
+  thickFineResults = Table[
+    Module[{pce = evalSeriesForThick[tf]},
+     Print["  thick = ", tf, "  ->  weighted Series PCE = ", pce, " %"];
+     {tf, pce}
+     ],
+    {tf, thickFineGrid}
+    ];
+  {optimalThick, optimalThickPCE} = First[MaximalBy[thickFineResults, Last]];
+  Print["OPTIMAL thick = ", optimalThick, "  (weighted Series PCE = ", optimalThickPCE, " % on the sample)"];
+
+  (* --- finalize: update the REAL global thick and rebuild the REAL
+     permanent thin-cell optics to match it *)
+  thick = optimalThick;
+  finalizeThinOptics[];
+
+  (* moduleRatio optimization (Module/VMM only) *)
+
+  (* Precompute the moduleRatio-INDEPENDENT quantities ONCE per sample
+     spectrum -- jgSitandem, jgPerovskitetandem, and the shared
+     perovskite JV table don't change no matter which moduleRatio is
+     tried next, which is what makes this sweep so much cheaper than
+     the thick sweep above. *)
+     
+  modulePrecomputed = Table[
+     Block[{AM1p5global = optimSample[[i]], GammaInterp, jgSiC, jgPerC, dPerC, PowerofSun},
+      PowerofSun = optimSampleIrradiance[[i]];
+      GammaInterp = Interpolation[makeFlux[AM1p5global]];
+      jgSiC = Quiet[NIntegrate[EQESiback[En] GammaInterp[En], {En, 0.8, 3.5}]];
+      jgPerC = Quiet[NIntegrate[EQEPerovskite[En] GammaInterp[En], {En, 1.2, 4.4}]];
+      dPerC = Quiet[Table[
+         {v2, FindRoot[Il2 == jgPerC - JRPerovskite[v2, Il2, 2, RsPerovskite] -
+             JRnonPerovskite[v2, Il2, RsPerovskite] - Resistance[v2, Il2, RsPerovskite, RshPerovskite],
+            {Il2, 0}][[1, 2]]},
+         {v2, 0, PerovskiteBandgap[T] - 0.2, dv}]];
+      {jgSiC, jgPerC, dPerC}
+      ],
+     {i, Length[optimSample]}
+     ];
+
+  evalModuleForRatio[nVal_] := Module[{pceList},
+     pceList = Table[
+       Block[{PowerofSun = optimSampleIrradiance[[i]], jgSitandem = modulePrecomputed[[i, 1]], pce},
+        pce = sanitizePCE[Check[Quiet[SQModule[SiBandgap[T], PerovskiteBandgap[T], nVal, modulePrecomputed[[i, 3]]]], $Failed]];
+        If[NumericQ[pce], pce, 0]
+        ],
+       {i, Length[optimSample]}
+       ];
+     Total[pceList*optimSampleIrradiance]/Total[optimSampleIrradiance]
+     ];
+
+  moduleRatioGrid = Range[1.0, 2.5, 0.05];
+  Print["--- Optimizing moduleRatio (Module/VMM) ---"];
+  moduleRatioResults = Table[
+    Module[{pce = evalModuleForRatio[nv]},
+     Print["  moduleRatio = ", nv, "  ->  weighted Module PCE = ", pce, " %"];
+     {nv, pce}
+     ],
+    {nv, moduleRatioGrid}
+    ];
+  {optimalModuleRatio, optimalModulePCE} = First[MaximalBy[moduleRatioResults, Last]];
+  Print["OPTIMAL moduleRatio = ", optimalModuleRatio, "  (weighted Module PCE = ", optimalModulePCE, " % on the sample)"];
+
+  moduleRatio = optimalModuleRatio;
+
+  Print["============================================================"];
+  Print["Optimization complete.  thick = ", thick, "   moduleRatio = ", moduleRatio];
+  Print["These are now the active values for Sections 4 and 5."];
+  Print["Run Section 5.2 (quick test), then Section 6 (full year) for the authoritative annual result at these optimized values."];
+  Print["============================================================"];
+  ],
+  (
+  finalizeThinOptics[]; (* cheap -- no sweep, just rebuilds the optics to match your manually-set thick *)
+  Print["autoOptimizeParameters = False -- using thick = ", thick, ", moduleRatio = ", moduleRatio,
+    " as set manually (thin-cell optics rebuilt to match this thick)."]
+  )
+ ];
+
+
+(*Section 5.2: Quick test*)
+
+(* TEST FIRST -- time a small batch before committing *)
+(* ALWAYS re-run this before Section 6, especially after changing dv above.
+   It tells you, in seconds, how long one timestep takes on your machine
+   so you can extrapolate the full realistic location-based runtime. *)
+
+testN = 20;
+testSlice = Min[testN, Length[allSpectra]];
+{testTime, testResults} = AbsoluteTiming[
+   runTandemForSpectrum /@ Transpose[{allSpectra[[1 ;; testSlice]], temperatures[[1 ;; testSlice]]}]
+   ];
+Print["Time for ", testN, " timesteps: ", testTime, " s  (",
+  N[testTime/testN], " s/timestep)"];
+Print["Estimated full-year time, single core: ",
+  N[testTime/testN*Length[allSpectra]/3600], " hours"];
+Print[TableForm[testResults,
+   TableHeadings -> {None, {"PowerofSun (W/m^2)", "Series tandem (%)", "Module tandem (%)", "Four-terminal (%)", "Temperature (K)"}}]];
+
+
+(*Section 6: Realistic annual data evaluation*)
+
+checkpointFile = NotebookDirectory[] <> "Output/checkpoint_annualResults.mx";
+chunkSize = 500; (* timesteps per chunk -- smaller = less memory per
+                     batch and less lost work if a kernel dies mid-chunk.
+                     Lower this further (e.g. 200) if crashes continue. *)
+
+LaunchKernels[];
+Print["Kernels running: ", $KernelCount];
+
+(* Distribute only what's needed to CALL runTandemForSpectrum -- NOT
+   allSpectra. Add any other support symbol here if you've customized
+   the earlier sections and runTandemForSpectrum now references it. *)
+   
+DistributeDefinitions[
+  c, h, h2, q, k, T, fac, k2, dv, L, RsSi, RshSi, RsPerovskite, RshPerovskite,
+  Sini, SiBandgap, SiC, PerovskiteBandgap, Perovskiteni, PerovskiteVbi, PerovskiteT,
+  EQESi, EQEPerovskite, EQESiback, EQESibackthin, EQEPerovskitethin,
+  makeFlux, JRSi, JRPerovskite, JRAuger, JRnonSi, JRnonPerovskite, Resistance,
+  JRad0SiOfT, JRad0PerovskiteOfT,
+  SQSeries, SQModule, SQFour,
+  computeSeries, computeModule, computeFour, lowLightCutoff, pceSanityCeiling, moduleRatio,
+  sanitizePCE, runTandemForSpectrum
+  ];
+
+(* Resume support: if a checkpoint from a previous (possibly crashed)
+   run exists, pick up from there instead of starting over. Delete the
+   checkpoint file yourself if you deliberately want a clean restart. *)
+   
+If[FileExistsQ[checkpointFile],
+  Get[checkpointFile];
+  Print["Resuming from checkpoint: ", Length[annualResults], " timesteps already done."],
+  annualResults = {}
+  ];
+
+nChunks = Ceiling[Length[allSpectra]/chunkSize];
+startChunk = Floor[Length[annualResults]/chunkSize] + 1;
+
+If[Length[annualResults] >= Length[allSpectra],
+  Print["Checkpoint already contains a complete run (", Length[annualResults],
+    " timesteps, dataset has ", Length[allSpectra],
+    "). Nothing to do -- delete Output/checkpoint_annualResults.mx first if you deliberately want to recompute from scratch."],
+  (
+   Do[
+     chunkRange = (chunkNum - 1)*chunkSize + 1 ;; Min[chunkNum*chunkSize, Length[allSpectra]];
+     chunkResult = ParallelMap[runTandemForSpectrum, Transpose[{allSpectra[[chunkRange]], temperatures[[chunkRange]]}]];
+     annualResults = Join[annualResults, chunkResult];
+     DumpSave[checkpointFile, annualResults];
+     Print["Chunk ", chunkNum, "/", nChunks, " done (", Length[annualResults], "/", Length[allSpectra], " timesteps so far)"];
+     ,
+     {chunkNum, startChunk, nChunks}
+     ];
+   Print["Full year complete: ", Length[annualResults], " timesteps."];
+   )
+  ];
+
+
+(*Section 7: Assemble & export modeled result data*)
+
+(* Guard: annualResults MUST have exactly one row per timestamp.
+   - Too LONG (a specific, known cause): if a checkpoint from Section 6
+     already covered everything and got an extra overlapping chunk
+     appended, the excess rows are always duplicates of the END of the
+     data -- safe to trim back to the correct length automatically.
+   - Too SHORT: means the run is genuinely incomplete (Section 6 didn't
+     finish, or annualResults is stale from testing on a shorter slice)
+     -- this is NOT safe to auto-fix, so it hard-stops instead. If you
+     see this, restart the kernel and re-run Section 6 to completion
+     before continuing (Evaluation > Quit Kernel, then Evaluate Notebook
+     -- not just re-running this one cell). *)
+     
+If[Length[annualResults] > Length[timeStamps],
+  Print["NOTE: annualResults had ", Length[annualResults], " rows for ", Length[timeStamps],
+    " timestamps -- trimming the extra ", Length[annualResults] - Length[timeStamps],
+    " duplicated rows from the end (leftover from an incomplete-chunk resume)."];
+  annualResults = annualResults[[1 ;; Length[timeStamps]]];
+  ];
+
+If[Length[annualResults] < Length[timeStamps],
+  Print["ERROR: annualResults has only ", Length[annualResults], " rows but timeStamps has ",
+    Length[timeStamps], " rows -- the run is genuinely incomplete. Restart the kernel and re-run Section 5 to completion before continuing."];
+  Abort[]
+  ];
+
+(* annualResults[[All,5]] is the temperature actually used inside each
+   call, echoed back from runTandemForSpectrum -- exporting THIS rather
+   than re-reading the standard room temperatures. *)
+   
+finalTable = Prepend[
+   Transpose[{timeStamps, annualResults[[All, 1]], annualResults[[All, 2]],
+     annualResults[[All, 3]], annualResults[[All, 4]], annualResults[[All, 5]]}],
+   {"Time", "PowerofSun (W/m^2)", "SeriesTandemPCE (%)", "ModuleTandemPCE (%)", "FourTerminalPCE (%)", "Temperature (K)"}
+   ];
+
+Export[NotebookDirectory[] <> "Output/AnnualTandemResults.csv", finalTable];
+Print["Saved: Output/AnnualTandemResults.csv"];
+
+(* Timestep spacing, auto-detected from actual timestamps*)
+   
+dtHours = (AbsoluteTime[timeStamps[[2]]] - AbsoluteTime[timeStamps[[1]]])/3600.;
+Print["Detected timestep: ", dtHours, " hours"];
+safe[col_] := Replace[col, (x_ /; ! (NumericQ[x] && -Infinity < x < Infinity)) -> 0, {1}]; (* treat toggled-off/failed/non-finite entries as 0 *)
+seriesYield = Total[safe[annualResults[[All, 2]]]/100 * annualResults[[All, 1]]] * dtHours/1000.;
+moduleYield = Total[safe[annualResults[[All, 3]]]/100 * annualResults[[All, 1]]] * dtHours/1000.;
+fourYield = Total[safe[annualResults[[All, 4]]]/100 * annualResults[[All, 1]]] * dtHours/1000.;
+
+Print["Annual energy yield (kWh/m^2/year):"];
+If[computeSeries, Print["  Series tandem:       ", seriesYield], Print["  Series tandem:       (not computed -- computeSeries = False)"]];
+If[computeModule, Print["  Module tandem:       ", moduleYield], Print["  Module tandem:       (not computed -- computeModule = False)"]];
+If[computeFour, Print["  Four-terminal tandem: ", fourYield], Print["  Four-terminal tandem: (not computed -- computeFour = False)"]];
+
+(* Irradiance-weighted average PCE *)
+If[computeSeries,
+  weightedSeriesPCE = Total[safe[annualResults[[All, 2]]]*annualResults[[All, 1]]]/Total[annualResults[[All, 1]]];
+  Print["Irradiance-weighted average series-tandem PCE: ", weightedSeriesPCE, " %"]];
+If[computeModule,
+  weightedModulePCE = Total[safe[annualResults[[All, 3]]]*annualResults[[All, 1]]]/Total[annualResults[[All, 1]]];
+  Print["Irradiance-weighted average module-tandem PCE: ", weightedModulePCE, " %"]];
+If[computeFour,
+  weightedFourPCE = Total[safe[annualResults[[All, 4]]]*annualResults[[All, 1]]]/Total[annualResults[[All, 1]]];
+  Print["Irradiance-weighted average four-terminal-tandem PCE: ", weightedFourPCE, " %"]];
+
+
+(*Section 8: PCE-vs-irradiance moving average (per architecture)*)
+
+archNames = {"SeriesTandem", "ModuleTandem", "FourTerminalTandem"};
+archCols = {2, 3, 4}; (* corresponding column in annualResults *)
+archActive = {computeSeries, computeModule, computeFour};
+activePos = Flatten[Position[archActive, True]];
+activeCols = archCols[[activePos]];
+activeNames = archNames[[activePos]];
+
+(* one shared table: {Irradiance, PCE_arch1, PCE_arch2, ...}, filtered to
+   daylight timesteps (Irradiance > 1 W/m^2) and sorted by irradiance *)
+combinedRaw = Select[
+   Transpose[Prepend[safe[annualResults[[All, #]]] & /@ activeCols, annualResults[[All, 1]]]],
+   #[[1]] > 1 &
+   ];
+combinedSorted = SortBy[combinedRaw, First];
+
+(*  scatter: ONE file, ONE shared Irradiance column, one PCE column
+   per active architecture *)
+Export[NotebookDirectory[] <> "Output/Tandem_Scatter_CommonIrradiance.csv",
+  Prepend[combinedSorted,
+    Prepend[(# <> "PCE (%)") & /@ activeNames, "Irradiance (W/m^2)"]]
+  ];
+Print["Saved: Output/Tandem_Scatter_CommonIrradiance.csv"];
+
+(* moving average: bin onto a FIXED common irradiance grid (not a
+   sliding window over raw points), then average each architecture's PCE
+   within each bin. This guarantees identical Irradiance values across
+   all three architectures, since the grid is chosen up front rather
+   than emerging from each architecture's own data independently. *)
+binWidth = 10.; (* W/m^2 per bin -- smaller = follows the scatter more
+                    closely, larger = smoother line. Tune to taste. *)
+
+grouped = GroupBy[combinedSorted, Round[#[[1]]/binWidth]*binWidth &, Mean[#[[All, 2 ;;]]] &];
+movingAverageTable = SortBy[KeyValueMap[Prepend[#2, #1] &, grouped], First];
+
+(* Second smoothing pass: even after binning, individual bins with few
+   data points can leave the line visibly jagged (e.g. a bin that only
+   happened to catch a handful of unusually high/low-PCE timesteps).
+   Average each bin's PCE together with its neighbors. This only smooths the PCE (y) values; the
+   Irradiance (x) values stay the true bin centers, just trimmed at
+   each end to keep the window centered -- no x-value smearing. *)
+smoothWindow = 5; (* must be odd; number of ADJACENT BINS averaged into
+                      the plotted/exported line. At binWidth=10, this
+                      smooths over roughly a +-25 W/m^2 neighborhood.
+                      Raise for a smoother line, lower to track the
+                      binned data more closely. *)
+If[Length[movingAverageTable] > smoothWindow,
+  Module[{trim = (smoothWindow - 1)/2},
+   movingAverageTable = Transpose[Prepend[
+      Table[MovingAverage[movingAverageTable[[All, i + 1]], smoothWindow], {i, Length[activeNames]}],
+      movingAverageTable[[trim + 1 ;; -trim - 1, 1]]
+      ]]
+   ]
+  ]; (* if there aren't enough bins to smooth, movingAverageTable is left as-is *)
+
+Export[NotebookDirectory[] <> "Output/Tandem_MovingAverage_CommonIrradiance.csv",
+  Prepend[movingAverageTable,
+    Prepend[(# <> "PCE_MovingAvg (%)") & /@ activeNames, "Irradiance (W/m^2)"]]
+  ];
+Print["Saved: Output/Tandem_MovingAverage_CommonIrradiance.csv"];
+
+(* combined scatter + moving-average plot: Series/2T = green, Module/VMM = red,
+   Four-terminal/4T = blue *)
+colorFor = <|"SeriesTandem" -> Darker[Green], "ModuleTandem" -> Red, "FourTerminalTandem" -> Blue|>;
+legendFor = <|"SeriesTandem" -> "Series (2T)", "ModuleTandem" -> "Module (VMM)", "FourTerminalTandem" -> "Four-terminal (4T)"|>;
+
+scatterSeries = Table[Transpose[{combinedSorted[[All, 1]], combinedSorted[[All, i + 1]]}], {i, Length[activeNames]}];
+maSeries = Table[Transpose[{movingAverageTable[[All, 1]], movingAverageTable[[All, i + 1]]}], {i, Length[activeNames]}];
+
+pceVsIrradiancePlot = Show[
+   ListPlot[
+    scatterSeries,
+    PlotStyle -> (Directive[colorFor[#], PointSize[0.0018], Opacity[0.2]] & /@ activeNames),
+    Frame -> True,
+    FrameLabel -> {"Irradiance (W/m^2)", "PCE (%)"},
+    PlotRange -> {{0, 1200}, {0, 45}},
+    ImageSize -> 520,
+    PlotLegends -> (legendFor[#] & /@ activeNames)
+    ],
+   ListLinePlot[
+    maSeries,
+    PlotStyle -> (Directive[Darker[colorFor[#], 0.3], Thickness[0.006]] & /@ activeNames)
+    ]
+   ];
+
+Export[NotebookDirectory[] <> "Output/PCE_vs_Irradiance_MovingAverage.png", pceVsIrradiancePlot];
+Print["Saved plot: Output/PCE_vs_Irradiance_MovingAverage.png"];
+pceVsIrradiancePlot
+
+
+(*Section 9: Organized data*)
+
+(* movingAverageTable only has one row per irradiance BIN (~120 rows),
+   while the scatter has one row per TIMESTEP (~8784 rows) -- they
+   can't share literal rows. Instead, build a linear interpolating
+   function through the moving-average bins for each architecture, then
+   evaluate it AT every scatter row's actual irradiance value. That gives
+   a moving-average column the same length as the scatter, defined at
+   the exact same Irradiance values -- a true single shared x-column,
+   ready to plot scatter + line together in Origin off one column. *)
+
+irradianceFull = combinedSorted[[All, 1]];
+minBinX = First[movingAverageTable][[1]];
+maxBinX = Last[movingAverageTable][[1]];
+
+maInterpolants = Table[
+   Interpolation[Transpose[{movingAverageTable[[All, 1]], movingAverageTable[[All, i + 1]]}],
+    InterpolationOrder -> 1],
+   {i, Length[activeNames]}
+   ];
+
+(* Clip guards against any scatter irradiance value falling a hair outside
+   the bin grid's covered range (e.g. the single highest/lowest reading of
+   the year, if it didn't get its own full bin) *)
+   
+maResampled = Table[
+   maInterpolants[[i]][Clip[#, {minBinX, maxBinX}]] & /@ irradianceFull,
+   {i, Length[activeNames]}
+   ];
+
+combinedSingleX = Prepend[
+   Join[combinedSorted, Transpose[maResampled], 2],
+   Join[
+    Prepend[(# <> "PCE (%)") & /@ activeNames, "Irradiance (W/m^2)"],
+    (# <> "PCE_MovingAvg (%)") & /@ activeNames
+    ]
+   ];
+
+Export[NotebookDirectory[] <> "Output/Tandem_Scatter_and_MovingAverage_SharedX.csv", combinedSingleX];
+Print["Saved: Output/Tandem_Scatter_and_MovingAverage_SharedX.csv  (",
+  Length[combinedSorted], " rows, one shared Irradiance column, scatter + moving-average PCE columns)"];
