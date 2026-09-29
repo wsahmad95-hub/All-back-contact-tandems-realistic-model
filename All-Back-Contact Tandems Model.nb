@@ -63,7 +63,7 @@ SiC[T_] := 6.89*10^-43*(T/300.)^(1./2.)
 
 (*Import IBC silicon solar cell J - V & EQE*)
 
-RecordSi = Import[NotebookDirectory[] <> "Input/IV-HTIBC-Si.csv"];
+RecordSi = Import[NotebookDirectory[] <> "Input/JV-HTIBC-Si.csv"];
 RecordSiEQE = Import[NotebookDirectory[] <> "Input/EQE-HTIBC-Si.csv"];
 EQESi = Interpolation[SortBy[RecordSiEQE, First], InterpolationOrder -> 1];
 
@@ -104,8 +104,8 @@ PerovskiteT[Irradiation_] := 2.63041*Irradiation^(-0.14)
 
 (*Import QIBC PSC J-V & EQE*)
 
-RecordPerovskiteForward = Import[NotebookDirectory[] <> "Input/JV-Ideal-1.62.csv"];
-RecordPerovskiteEQE = Import[NotebookDirectory[] <> "Input/EQE-ideal-1.62.csv"];
+RecordPerovskiteForward = Import[NotebookDirectory[] <> "Input/JV-QIBC-PSC.csv"];
+RecordPerovskiteEQE = Import[NotebookDirectory[] <> "Input/EQE-QIBC-PSC.csv"];
 EQEPerovskite = Interpolation[SortBy[RecordPerovskiteEQE, First], InterpolationOrder -> 1];
 
 (*Recombination current terms and parasitic resistances*)
