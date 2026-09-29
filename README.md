@@ -1,4 +1,4 @@
-# All-Back-Contact Perovskite/Silicon Tandem Solar Cell Model
+# All-Back-Contact Perovskite/Silicon Tandem Solar Cell Realistic Model
 
 Wolfram Language code for modeling quasi-interdigitated back-contact perovskite solar cell (QIBC PSC) / interdigitated back-contact (IBC) silicon tandems under location-dependent solar spectra and temperature conditions.
 
