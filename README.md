@@ -12,7 +12,7 @@ This study examines how electrical coupling and device losses influence the perf
 | **VMM** | Voltage-matched two-terminal module tandem | Perovskite and silicon strings operate at a common terminal voltage, and their currents add. |
 | **4T** | Four-terminal tandem | The subcells operate at independent maximum-power points, and their powers add. |
 
-The outdoor analysis uses fixed-tilt spectral irradiance data obtained from the National Solar Radiation Database (NSRDB) for **2020**, at **60-minute resolution**, for four locations:
+The outdoor analysis uses fixed-tilt spectral irradiance data obtained from https://nsrdb.nlr.gov/data-viewer for **2020**, at **60-minute resolution**, for four locations:
 
 - **Singapore** — tropical environment.
 - **Phoenix, Arizona, USA** — hot, dry environment.
