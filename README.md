@@ -139,7 +139,7 @@ When using this adaptation, please cite the original Futscher–Ehrler paper and
 
 [https://github.com/wsahmad95-hub/All-back-contact-tandems-realistic-model](https://github.com/wsahmad95-hub/All-back-contact-tandems-realistic-model)
 
-The associated manuscript is titled **“Electrical Coupling Governs the Outdoor Performance of All-Back-Contact Perovskite/Silicon Tandem Solar Cells.”** Its publication citation and a version-specific software DOI can be added when available.
+The associated manuscript is titled **“Electrical Coupling Guided Outdoor Performance of All-Back-Contact Perovskite/Silicon Tandem Solar Cells.”** Its publication citation and a version-specific software DOI can be added when available.
 
 ## Questions and reproducibility reports
 
