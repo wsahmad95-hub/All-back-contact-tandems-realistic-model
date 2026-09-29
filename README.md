@@ -53,10 +53,10 @@ All-back-contact-tandems-realistic-model/
 ├── LICENSE
 ├── .gitignore
 ├── Input/
-│   ├── IV-HTIBC-Si.csv
+│   ├── JV-HTIBC-Si.csv
 │   ├── EQE-HTIBC-Si.csv
-│   ├── JV-Ideal-1.62.csv
-│   ├── EQE-ideal-1.62.csv
+│   ├── JV-QIBC-PSC.csv
+│   ├── EQE-QIBC-PSC.csv
 │   ├── Singapore-Spectra.xlsx
 │   └── Singapore-Temperature.xlsx
 └── Output/
@@ -64,10 +64,10 @@ All-back-contact-tandems-realistic-model/
 
 | Input filename | Description |
 |---|---|
-| `IV-HTIBC-Si.csv` | Reference silicon current-density–voltage data |
+| `JV-HTIBC-Si.csv` | Reference silicon current-density–voltage data |
 | `EQE-HTIBC-Si.csv` | Reference silicon external quantum efficiency |
-| `JV-Ideal-1.62.csv` | Optimized perovskite current-density–voltage data |
-| `EQE-ideal-1.62.csv` | Optimized perovskite external quantum efficiency |
+| `JV-QIBC-PSC.csv` | Optimized perovskite current-density–voltage data |
+| `EQE-QIBC-PSC.csv` | Optimized perovskite external quantum efficiency |
 | `Singapore-Spectra.xlsx` | Time-resolved Singapore spectral irradiance |
 | `Singapore-Temperature.xlsx` | Corresponding Singapore temperature series |
 
